@@ -1,0 +1,15 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+
+# Large/local data (download separately)
+*.csv
+simular_curvitas/simulated_images/
+simular_curvitas/previews/
