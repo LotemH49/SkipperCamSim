@@ -7,29 +7,31 @@ import pandas as pd
 #tunables
 exposure_time = 8  # seconds
 readout_noise = 7.0  # e- RMS per pixel (fast survey mode)
-
+psf_sigma_pix = 1  # Gaussian PSF σ [pix]; sole PSF tunable (FWHM ≈ 2.355σ)
+psf_trunc_sigma = 5  # truncate kernel at this many σ (~99.7% flux enclosed)
+psf_pad_pix = math.ceil(psf_trunc_sigma * psf_sigma_pix)  # catalog pad matches kernel
 # Define the LMC coordinates
 lmc_ra = 80.89
 lmc_dec = -69.76
 pix_size = 1.43  # arcsec per pix
+pixel_pitch_mm = 15e-3  # 15 µm detector pitch
+ccd_width_px = 1278
+ccd_height_px = 1058
+ccd_width_mm = ccd_width_px * pixel_pitch_mm
+ccd_height_mm = ccd_height_px * pixel_pitch_mm
 
-# Pick the simulated patch size directly in pixels.
-# This drives the RA/Dec box via the local plate scale.
-width_px = 1278
-height_px = 1058
 
 _pix_scale_deg = pix_size / 3600.0
+_arcsec_per_mm = pix_size / pixel_pitch_mm
 _cos_dec = math.cos(math.radians(lmc_dec))
-lmc_ra_read_radius = 0.5 * width_px * _pix_scale_deg / max(_cos_dec, 1e-12)
-lmc_dec_read_radius = 0.5 * height_px * _pix_scale_deg
+ccd_ra_read_radius = 0.5 * ccd_width_px * _pix_scale_deg / max(_cos_dec, 1e-12)
+ccd_dec_read_radius = 0.5 * ccd_height_px * _pix_scale_deg
 
-ZP_g = 13149669667  # integrated e- for a 0-mag source in one exposure
+ZP_g = 1.64E+09  # integrated e- for a 0-mag source in one exposure
 m_ref = 2.5 * np.log10(ZP_g)  # reference magnitude tied to ZP_g
-n_ref = 1.0 / exposure_time  # e-/s at m_ref; get_charge(0) == ZP_g
-sky_e_rate = 6.3  # e- / s / pixel (SkipperCam paper Sec. 2.4)
+sky_e_rate = 3.11E+01  # e- / s / pixel (SkipperCam paper Sec. 2.4)[changes with 0 point]
 g_lim = 20  # monitored sources: g < g_lim (INFO.md / paper)
-psf_sigma_pix = 2  # Gaussian PSF sigma
-psf_pad_pix = math.ceil(3.0 * psf_sigma_pix)  # matches make_psf_kernel radius
+ccd_number = 20  # 1-20
 psf_pad_deg = psf_pad_pix * pix_size / 3600.0
 psf_pad_deg_ra = psf_pad_deg / max(_cos_dec, 1e-12)
 psf_deposit_batch_size = 50_000  # stars per PSF stamp batch (limits RAM)
@@ -37,15 +39,34 @@ faint_gmag_max = 99  # SMASH sentinel for valid magnitudes
 
 # Load SMASH DR2 sample data
 smash_df = pd.read_csv("lmc_smash_g99_v2.csv")
+#smash_df = pd.read_csv("lmc_onestar_tester.csv")
 
+# CCD center offset from array center (mm). +x = +RA, +y = +Dec. (0, 0) = lmc_ra/lmc_dec.
+ccd_location: dict[int, tuple[float, float]] = {
+    1: (-38.93833 , 40.5488),
+    2: (0.0, 0.0),
+    3: (0.0, 0.0),
+    4: (38.93833 , 40.5488),
+    5: (0.0, 0.0),
+    6: (0.0, 0.0),
+    7: (0.0, 0.0),
+    8: (0.0, 0.0),
+    9: (0.0, 0.0),
+    10: (0.0, 0.0),
+    11: (0.0, 0.0),
+    12: (0.0, 0.0),
+    13: (0.0, 0.0),
+    14: (0.0, 0.0),
+    15: (0.0, 0.0),
+    16: (0 , 0),
+    17: (-38.93833 , -40.5488),
+    18: (0.0, 0.0),
+    19: (0.0, 0.0),
+    20: (38.93833 , -40.5488),
+}
 
-# Pixel width/height for the sky patch at the given plate scale.
-def patch_size_pixels(ra_read_radius, dec_read_radius, center_dec, pix_size_arcsec):
-    pix_scale_deg = pix_size_arcsec / 3600.0
-    cos_dec = math.cos(math.radians(center_dec))
-    width = int(np.ceil(2.0 * ra_read_radius * cos_dec / pix_scale_deg))
-    height = int(np.ceil(2.0 * dec_read_radius / pix_scale_deg))
-    return max(width, 1), max(height, 1)
+def get_ccd_location(ccd_number):
+    return ccd_location[ccd_number]
 
 
 # Select SMASH catalog rows inside the RA/Dec read box.
@@ -62,7 +83,7 @@ def get_smash_data(ra, dec, ra_read_radius, dec_read_radius):
 # Convert g-band magnitude to photoelectrons for one exposure.
 def get_charge(m_target, m_ref_mag=m_ref, exposure_time_s=exposure_time):
     m_target = np.asarray(m_target, dtype=np.float64)
-    rate = n_ref * np.power(10.0, -0.4 * (m_target - m_ref_mag))
+    rate =  np.power(10.0, -0.4 * (m_target - m_ref_mag))
     return rate * exposure_time_s
 
 
@@ -77,11 +98,20 @@ def sky_to_pixel(ra, dec, center_ra, center_dec, pix_size_arcsec, width, height)
     return x, y
 
 
-# Build a normalized 2D Gaussian PSF kernel for stamping star flux.
-def make_psf_kernel(sigma_pix, radius_sigma=3.0):
-    radius_int = int(math.ceil(radius_sigma * sigma_pix))
+def ccd_sky_center(ccd_id):
+    """Sky RA/Dec at CCD center; ccd_location is (dx, dy) mm from array center."""
+    dx_mm, dy_mm = get_ccd_location(ccd_id)
+    dra_deg = dx_mm * _arcsec_per_mm / 3600.0 / max(_cos_dec, 1e-12)
+    ddec_deg = dy_mm * _arcsec_per_mm / 3600.0
+    return lmc_ra + dra_deg, lmc_dec + ddec_deg
+
+
+# Build a normalized circular 2D Gaussian PSF kernel (truncated at psf_trunc_sigma * σ).
+def make_psf_kernel():
+    radius_int = psf_pad_pix
     dy, dx = np.mgrid[-radius_int : radius_int + 1, -radius_int : radius_int + 1]
-    weights = np.exp(-0.5 * (dx * dx + dy * dy) / (sigma_pix * sigma_pix))
+    r2 = dx * dx + dy * dy
+    weights = np.exp(-0.5 * r2 / (psf_sigma_pix * psf_sigma_pix))
     weights /= weights.sum()
     offsets = np.column_stack([dy.ravel(), dx.ravel()])
     return offsets, weights.ravel().astype(np.float32)
@@ -129,16 +159,17 @@ def pixelate_smash_data(
     exposure_time_s=exposure_time,
     m_ref_mag=m_ref,
     g_lim_mag=g_lim,
-    sigma_pix=psf_sigma_pix,
+    width_px=ccd_width_px,
+    height_px=ccd_height_px,
 ):
-    width, height = patch_size_pixels(
-        ra_read_radius, dec_read_radius, center_dec, pix_size_arcsec
-    )
+    width, height = width_px, height_px
     stars = smash_data[smash_data["gmag"] < faint_gmag_max].copy()
+
+    
     if stars.empty:
         return np.zeros((height, width), dtype=np.float32), stars
 
-    stars["monitored"] = stars["gmag"] < g_lim_mag
+    stars["monitored"] = stars["gmag"] < faint_gmag_max
     x, y = sky_to_pixel(
         stars["ra"].to_numpy(),
         stars["dec"].to_numpy(),
@@ -156,13 +187,12 @@ def pixelate_smash_data(
         m_ref_mag=m_ref_mag,
         exposure_time_s=exposure_time_s,
     )
-
-    offsets, weights = make_psf_kernel(sigma_pix)
+    offsets, weights = make_psf_kernel()
 
     image = np.zeros((height, width), dtype=np.float32)
     print(
         f"Depositing {len(stars):,} stars "
-        f"(PSF sigma={sigma_pix} pix, kernel={len(weights)} px)...",
+        f"(PSF σ={psf_sigma_pix} pix, kernel={len(weights)} px)...",
         flush=True,
     )
     _deposit_psf(
@@ -290,23 +320,27 @@ def display_ideal_vs_noisy(ideal_image, noisy_image, vmin_pct=1.0, vmax_pct=99.0
 
 # Load SMASH data, pixelate, simulate noise, print survey stats, and display.
 def main():
+    ccd_ra, ccd_dec = ccd_sky_center(ccd_number)
+
     smash_data = get_smash_data(
-        lmc_ra,
-        lmc_dec,
-        lmc_ra_read_radius + psf_pad_deg_ra,
-        lmc_dec_read_radius + psf_pad_deg,
+        ccd_ra,
+        ccd_dec,
+        ccd_ra_read_radius + psf_pad_deg_ra,
+        ccd_dec_read_radius + psf_pad_deg,
     )
     ideal_image, stars_on_patch = pixelate_smash_data(
         smash_data,
-        lmc_ra,
-        lmc_dec,
-        lmc_ra_read_radius,
-        lmc_dec_read_radius,
+        ccd_ra,
+        ccd_dec,
+        ccd_ra_read_radius,
+        ccd_dec_read_radius,
     )
     noisy_image = simulate_microchip(ideal_image)
 
+    dx_mm, dy_mm = get_ccd_location(ccd_number)
+    print(f"CCD {ccd_number} offset from array center: ({dx_mm:.3f}, {dy_mm:.3f}) mm")
+    print(f"CCD sky center: RA={ccd_ra:.5f}, Dec={ccd_dec:.5f}")
     print(f"Patch size: {ideal_image.shape[1]} x {ideal_image.shape[0]} pix")
-    print(f"m_ref={m_ref:.4f}, n_ref={n_ref:.6f} e-/s, charge(0)={get_charge(0):.4e} e-")
     print(f"Charge at g={g_lim}: {get_charge(g_lim):.2f} e-")
     n_deposited = len(smash_data[smash_data["gmag"] < faint_gmag_max])
     print(f"Deposited stars (incl. PSF pad): {n_deposited:,}")
@@ -325,6 +359,7 @@ def main():
             print(f"Median monitored star charge [e-]: {mon['charge'].median():.2f}")
 
     display_ideal_vs_noisy(ideal_image, noisy_image)
+    
 
 
 if __name__ == "__main__":
