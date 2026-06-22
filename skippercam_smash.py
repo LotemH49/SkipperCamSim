@@ -1,4 +1,5 @@
 import math
+from pathlib import Path
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -8,9 +9,15 @@ from astropy.wcs import WCS
 
 #tunables
 ccd_number = 12  # 1-20
+write_mef = True
+_PROJECT_ROOT = Path(__file__).resolve().parent
+mef_path = "FITS/skippercam_sim_v2.fits"
+focal_plane_gaps = False  # False = abutting 4x5 grid; True = physical mm gaps
+write_focal_plane = False  # auto-stitch after MEF export
+focal_plane_path = "FITS/skippercam_focal_plane_sim_v2.fits"
 exposure_time = 8  # seconds
 readout_noise = 7.0  # e- RMS per pixel (fast survey mode)
-psf_sigma_pix = 1  # Gaussian PSF σ [pix]; sole PSF tunable (FWHM ≈ 2.355σ)
+psf_sigma_pix = 1.5  # Gaussian PSF σ [pix]; sole PSF tunable (FWHM ≈ 2.355σ)
 psf_trunc_sigma = 5  # truncate kernel at this many σ 
 psf_pad_pix = math.ceil(psf_trunc_sigma * psf_sigma_pix)  # catalog pad matches kernel
 catalog_extra_pad_pix = 2  # extra catalog margin for edge overlap
@@ -19,8 +26,8 @@ lmc_ra = 80.89
 lmc_dec = -69.76
 pix_size = 1.43  # arcsec per pix
 pixel_pitch_mm = 15e-3  # 15 µm detector pitch
-factor = 2 # for testing
-ccd_width_px = 1278*factor
+factor = 1 # for testing
+ccd_width_px = 1278
 ccd_height_px = 1058
 ccd_width_mm = ccd_width_px * pixel_pitch_mm
 ccd_height_mm = ccd_height_px * pixel_pitch_mm
@@ -55,7 +62,7 @@ ccd_location: dict[int, tuple[float, float]] = {
     2: (ccd_1_x + x_offset, ccd_1_y ),
     3: (ccd_1_x + x_offset*2, ccd_1_y ),
     4: (ccd_1_x + x_offset*3, ccd_1_y ),
-    5: (ccd_1_x , ccd_1_y + y_offset),
+    5: (ccd_1_x , ccd_1_y - y_offset),
     6: (ccd_1_x + x_offset, ccd_1_y - y_offset),
     7: (ccd_1_x + x_offset*2, ccd_1_y - y_offset),
     8: (ccd_1_x + x_offset*3, ccd_1_y - y_offset),
@@ -75,6 +82,27 @@ ccd_location: dict[int, tuple[float, float]] = {
 
 def get_ccd_location(ccd_number):
     return ccd_location[ccd_number]
+
+
+def resolve_fits_path(path: str | Path) -> Path:
+    """Resolve FITS paths under the project; map /FITS/... → project/FITS/..."""
+    p = Path(path).expanduser()
+    if p.is_absolute() and not p.exists():
+        parts = p.parts
+        if len(parts) >= 3 and parts[1] == "FITS":
+            candidate = _PROJECT_ROOT / "FITS" / Path(*parts[2:])
+            if candidate.is_file():
+                return candidate.resolve()
+    if not p.is_absolute():
+        p = _PROJECT_ROOT / p
+    return p.resolve()
+
+
+def ensure_fits_parent(path: str | Path) -> Path:
+    """Ensure parent directory exists for a FITS output path."""
+    p = resolve_fits_path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    return p
 
 
 # Select SMASH catalog rows inside the RA/Dec read box.
@@ -126,6 +154,297 @@ def ccd_sky_extents(center_dec):
     return ra_radius, dec_radius, pad_ra, pad_dec
 
 
+def make_ccd_wcs(ra_center, dec_center, width_px, height_px, pix_size_arcsec=pix_size):
+    """WCS inverse of sky_to_pixel (+x = +RA, +y = +Dec, origin lower)."""
+    pix_scale_deg = pix_size_arcsec / 3600.0
+    cos_dec = math.cos(math.radians(dec_center))
+    wcs = WCS(naxis=2)
+    wcs.wcs.crval = [ra_center, dec_center]
+    wcs.wcs.crpix = [width_px / 2 + 0.5, height_px / 2 + 0.5]
+    wcs.wcs.cd = [[pix_scale_deg / cos_dec, 0.0], [0.0, pix_scale_deg]]
+    wcs.wcs.ctype = ["RA---TAN", "DEC--TAN"]
+    wcs.wcs.cunit = ["deg", "deg"]
+    wcs.wcs.radesys = "ICRS"
+    wcs.wcs.equinox = 2000.0
+    return wcs
+
+
+def _focal_plane_bounds_mm():
+    """Bounding box of all CCDs in mm (+x=+RA, +y=+Dec)."""
+    half_w_mm = ccd_width_mm / 2
+    half_h_mm = ccd_height_mm / 2
+    x_mm: list[float] = []
+    y_mm: list[float] = []
+    for ccd_id in range(1, 21):
+        dx, dy = get_ccd_location(ccd_id)
+        x_mm.extend([dx - half_w_mm, dx + half_w_mm])
+        y_mm.extend([dy - half_h_mm, dy + half_h_mm])
+    return min(x_mm), max(x_mm), min(y_mm), max(y_mm)
+
+
+def _focal_plane_canvas_shape():
+    min_x, max_x, min_y, max_y = _focal_plane_bounds_mm()
+    mosaic_w = int(math.ceil((max_x - min_x) / pixel_pitch_mm))
+    mosaic_h = int(math.ceil((max_y - min_y) / pixel_pitch_mm))
+    return mosaic_w, mosaic_h, min_x, min_y
+
+
+def _ccd_pixel_origin(ccd_id, min_x_mm, min_y_mm):
+    """Lower-left chip corner in focal-plane canvas pixels (origin lower)."""
+    dx, dy = get_ccd_location(ccd_id)
+    px_per_mm = 1.0 / pixel_pitch_mm
+    half_w_mm = ccd_width_mm / 2
+    half_h_mm = ccd_height_mm / 2
+    x0 = int(round((dx - half_w_mm - min_x_mm) * px_per_mm))
+    y0 = int(round((dy - half_h_mm - min_y_mm) * px_per_mm))
+    return x0, y0
+
+
+def _ccd_det_keywords_abut(ccd_id, width_px, height_px):
+    """IRAF mosaic section: abutting 4x5 grid (no gaps)."""
+    col = (ccd_id - 1) % 4
+    row = 4 - (ccd_id - 1) // 4
+    x1 = col * width_px + 1
+    x2 = (col + 1) * width_px
+    y1 = row * height_px + 1
+    y2 = (row + 1) * height_px
+    mosaic_w = 4 * width_px
+    mosaic_h = 5 * height_px
+    return {
+        "DETSIZE": (f"[1:{mosaic_w},1:{mosaic_h}]", "Full focal-plane detector extent"),
+        "DETSEC": (
+            f"[{x1}:{x2},{y1}:{y2}]",
+            "CCD section on focal plane [1-based]",
+        ),
+        "CCDSEC": (f"[1:{width_px},1:{height_px}]", "Valid data section"),
+    }
+
+
+def _ccd_det_keywords_gaps(ccd_id, width_px, height_px):
+    """IRAF mosaic section from true focal-plane mm layout (includes gaps)."""
+    mosaic_w, mosaic_h, min_x, min_y = _focal_plane_canvas_shape()
+    x0, y0 = _ccd_pixel_origin(ccd_id, min_x, min_y)
+    x1 = x0 + 1
+    x2 = x0 + width_px
+    y1 = y0 + 1
+    y2 = y0 + height_px
+    return {
+        "DETSIZE": (f"[1:{mosaic_w},1:{mosaic_h}]", "Full focal-plane detector extent"),
+        "DETSEC": (
+            f"[{x1}:{x2},{y1}:{y2}]",
+            "CCD section on focal plane [1-based]",
+        ),
+        "CCDSEC": (f"[1:{width_px},1:{height_px}]", "Valid data section"),
+    }
+
+
+def _ccd_det_keywords(ccd_id, width_px, height_px, gaps=None):
+    use_gaps = focal_plane_gaps if gaps is None else gaps
+    if use_gaps:
+        return _ccd_det_keywords_gaps(ccd_id, width_px, height_px)
+    return _ccd_det_keywords_abut(ccd_id, width_px, height_px)
+
+
+def _stitch_focal_plane_abut(mef_path, out_path):
+    """Stitch MEF into abutting 4x5 grid (no gaps between chips)."""
+    mosaic_w = 4 * ccd_width_px
+    mosaic_h = 5 * ccd_height_px
+    canvas = np.zeros((mosaic_h, mosaic_w), dtype=np.float32)
+    with fits.open(mef_path) as hdul:
+        for ccd_id in range(1, len(hdul)):
+            data = hdul[ccd_id].data
+            col = (ccd_id - 1) % 4
+            row = 4 - (ccd_id - 1) // 4
+            y0 = row * ccd_height_px
+            x0 = col * ccd_width_px
+            canvas[y0 : y0 + ccd_height_px, x0 : x0 + ccd_width_px] = data
+
+    header = fits.Header()
+    header["ARRAY_RA"] = lmc_ra
+    header["ARRAY_DEC"] = lmc_dec
+    header["NCCD"] = 20
+    header["BUNIT"] = "electron"
+    header["COMMENT"] = "Abutting 4x5 stitch (no gaps)"
+    fits.PrimaryHDU(canvas, header=header).writeto(out_path, overwrite=True)
+    print(f"Wrote focal-plane stitch: {out_path} ({mosaic_w}x{mosaic_h})", flush=True)
+
+
+def _stitch_focal_plane_gaps(mef_path, out_path):
+    """Stitch MEF using true mm chip positions; gaps are zero pixels."""
+    mosaic_w, mosaic_h, min_x, min_y = _focal_plane_canvas_shape()
+    canvas = np.zeros((mosaic_h, mosaic_w), dtype=np.float32)
+    with fits.open(mef_path) as hdul:
+        for ccd_id in range(1, len(hdul)):
+            data = hdul[ccd_id].data
+            height, width = data.shape
+            x0, y0 = _ccd_pixel_origin(ccd_id, min_x, min_y)
+            canvas[y0 : y0 + height, x0 : x0 + width] = data
+
+    wcs = make_ccd_wcs(lmc_ra, lmc_dec, mosaic_w, mosaic_h)
+    header = wcs.to_header(relax=True)
+    for key in list(header):
+        if key.startswith(("PC", "CDELT")):
+            del header[key]
+    cd = wcs.wcs.cd
+    header["CD1_1"] = cd[0, 0]
+    header["CD1_2"] = cd[0, 1]
+    header["CD2_1"] = cd[1, 0]
+    header["CD2_2"] = cd[1, 1]
+    header["RADESYS"] = "ICRS"
+    header["EQUINOX"] = 2000.0
+    header["NCCD"] = 20
+    header["BUNIT"] = "electron"
+    header["COMMENT"] = "Focal-plane stitch with physical gaps (mm layout)"
+    fits.PrimaryHDU(canvas.astype(np.float32), header=header).writeto(
+        out_path, overwrite=True
+    )
+    gap_x = int(round((x_offset - ccd_width_mm) / pixel_pitch_mm))
+    gap_y = int(round((y_offset - ccd_height_mm) / pixel_pitch_mm))
+    print(
+        f"Wrote focal-plane stitch: {out_path} ({mosaic_w}x{mosaic_h}), "
+        f"gap ~{gap_x}x{gap_y} px",
+        flush=True,
+    )
+
+
+def stitch_focal_plane(mef_path=mef_path, out_path=focal_plane_path, gaps=None):
+    """Stitch MEF to one focal-plane image (default: abutting 4x5, no gaps)."""
+    mef_path = resolve_fits_path(mef_path)
+    out_path = ensure_fits_parent(out_path)
+    if not mef_path.is_file():
+        raise FileNotFoundError(f"MEF not found: {mef_path}")
+    use_gaps = focal_plane_gaps if gaps is None else gaps
+    if use_gaps:
+        _stitch_focal_plane_gaps(mef_path, out_path)
+    else:
+        _stitch_focal_plane_abut(mef_path, out_path)
+
+
+def _ccd_fits_header(wcs, ccd_id, width_px, height_px, dx_mm, dy_mm, gaps=None):
+    """FITS header for one CCD extension (DS9 Mosaic WCS + IRAF DETSEC)."""
+    header = wcs.to_header(relax=True)
+    for key in list(header):
+        if key.startswith(("PC", "CDELT")):
+            del header[key]
+    cd = wcs.wcs.cd
+    header["CD1_1"] = cd[0, 0]
+    header["CD1_2"] = cd[0, 1]
+    header["CD2_1"] = cd[1, 0]
+    header["CD2_2"] = cd[1, 1]
+    header["WCSAXES"] = 2
+    header["RADESYS"] = "ICRS"
+    header["EQUINOX"] = 2000.0
+    header["EXTNAME"] = f"CCD{ccd_id:02d}"
+    header["CCDID"] = ccd_id
+    header["HPUID"] = ccd_id
+    header["FPOSX"] = (dx_mm, "mm from array center (+RA)")
+    header["FPOSY"] = (dy_mm, "mm from array center (+Dec)")
+    header["EXPTIME"] = exposure_time
+    header["RDNOISE"] = readout_noise
+    header["BUNIT"] = "electron"
+    for key, value in _ccd_det_keywords(ccd_id, width_px, height_px, gaps=gaps).items():
+        header[key] = value
+    return header
+
+
+def patch_mef_headers(path=mef_path, gaps=None):
+    """Rewrite WCS/DETSEC headers on an existing MEF (no re-simulation)."""
+    path = resolve_fits_path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"MEF not found: {path}")
+    use_gaps = focal_plane_gaps if gaps is None else gaps
+    with fits.open(path, mode="readonly") as hdul:
+        primary = fits.PrimaryHDU(data=None, header=hdul[0].header)
+        out = fits.HDUList([primary])
+        for ccd_id in range(1, len(hdul)):
+            data = hdul[ccd_id].data
+            height, width = data.shape
+            ra, dec = ccd_sky_center(ccd_id)
+            dx_mm, dy_mm = get_ccd_location(ccd_id)
+            wcs = make_ccd_wcs(ra, dec, width, height)
+            header = _ccd_fits_header(
+                wcs, ccd_id, width, height, dx_mm, dy_mm, gaps=use_gaps
+            )
+            out.append(fits.ImageHDU(data.astype(np.float32), header=header))
+    out.writeto(path, overwrite=True)
+    mode = "gaps" if use_gaps else "abut"
+    print(f"Patched headers ({mode}) in {path}", flush=True)
+
+
+def simulate_ccd(ccd_id):
+    """Pixelate and noise-simulate one CCD; returns images, sky center, focal-plane offset, stars."""
+    ccd_ra, ccd_dec = ccd_sky_center(ccd_id)
+    ra_radius, dec_radius, pad_ra, pad_dec = ccd_sky_extents(ccd_dec)
+    smash_data = get_smash_data(
+        ccd_ra,
+        ccd_dec,
+        ra_radius + pad_ra,
+        dec_radius + pad_dec,
+    )
+    ideal_image, stars_on_patch = pixelate_smash_data(
+        smash_data,
+        ccd_ra,
+        ccd_dec,
+        ra_radius,
+        dec_radius,
+    )
+    noisy_image = simulate_microchip(ideal_image)
+    dx_mm, dy_mm = get_ccd_location(ccd_id)
+    return ideal_image, noisy_image, ccd_ra, ccd_dec, dx_mm, dy_mm, stars_on_patch
+
+
+def _primary_mef_header():
+    header = fits.Header()
+    header["ARRAY_RA"] = (lmc_ra, "Array center RA [deg]")
+    header["ARRAY_DEC"] = (lmc_dec, "Array center Dec [deg]")
+    header["NCCD"] = (20, "Number of CCD extensions")
+    header["EXPTIME"] = (exposure_time, "Exposure time [s]")
+    header["RDNOISE"] = (readout_noise, "Readout noise sigma [e-]")
+    header["PIXSIZE"] = (pix_size, "Pixel scale [arcsec/pix]")
+    header["BUNIT"] = "electron"
+    header["ZPREF"] = (m_ref, "Reference magnitude for ZP_g")
+    header["SKYRATE"] = (sky_e_rate, "Sky rate [e-/s/pix]")
+    header["PSFSIG"] = (psf_sigma_pix, "Gaussian PSF sigma [pix]")
+    return header
+
+
+def _log_wcs_check(ccd_id, wcs, stars):
+    star = stars.iloc[0]
+    world = wcs.all_pix2world(star["x_pix"], star["y_pix"], 0)
+    cos_star = math.cos(math.radians(star["dec"]))
+    dra_arcsec = (world[0] - star["ra"]) * cos_star * 3600.0
+    ddec_arcsec = (world[1] - star["dec"]) * 3600.0
+    residual = math.hypot(dra_arcsec, ddec_arcsec)
+    print(
+        f"WCS check (CCD {ccd_id}): residual {residual:.3f} arcsec",
+        flush=True,
+    )
+
+
+def write_mosaic_mef(path=mef_path):
+    """Write 20-CCD visit as MEF: empty primary + one noisy ImageHDU per CCD."""
+    path = ensure_fits_parent(path)
+    primary = fits.PrimaryHDU(data=None, header=_primary_mef_header())
+    hdul = fits.HDUList([primary])
+    wcs_check_done = False
+
+    for ccd_id in range(1, 21):
+        _ideal, noisy, ra, dec, dx_mm, dy_mm, stars_on_patch = simulate_ccd(ccd_id)
+        height, width = noisy.shape
+        wcs = make_ccd_wcs(ra, dec, width, height)
+        header = _ccd_fits_header(wcs, ccd_id, width, height, dx_mm, dy_mm)
+        hdul.append(fits.ImageHDU(noisy.astype(np.float32), header=header))
+        print(f"CCD {ccd_id}/20 written to MEF", flush=True)
+
+        if not wcs_check_done and len(stars_on_patch) > 0:
+            _log_wcs_check(ccd_id, wcs, stars_on_patch)
+            wcs_check_done = True
+
+    hdul.writeto(path, overwrite=True)
+    if write_focal_plane:
+        stitch_focal_plane(path, focal_plane_path)
+
+
 # Build a normalized circular 2D Gaussian PSF kernel (truncated at psf_trunc_sigma * σ).
 def make_psf_kernel():
     radius_int = psf_pad_pix
@@ -160,10 +479,8 @@ def _deposit_psf(image, x, y, charge, offsets, weights, batch_size=psf_deposit_b
             & (all_x < width)
         )
         w_on_chip = weights[None, :] * valid
-        w_sum = w_on_chip.sum(axis=1, keepdims=True)
-        on_chip = w_sum > 0
-        w_sum = np.maximum(w_sum, 1e-12)
-        all_c = np.where(on_chip, ch_b[:, None] * w_on_chip / w_sum, 0.0)
+        # No edge renormalization: clipped PSF flux leaves the chip.
+        all_c = ch_b[:, None] * w_on_chip
 
         flat_y = all_y.ravel()
         flat_x = all_x.ravel()
@@ -345,25 +662,21 @@ def display_ideal_vs_noisy(ideal_image, noisy_image, vmin_pct=1.0, vmax_pct=99.0
 
 # Load SMASH data, pixelate, simulate noise, print survey stats, and display.
 def main():
-    ccd_ra, ccd_dec = ccd_sky_center(ccd_number)
+    if write_mef:
+        print(f"Writing 20-CCD MEF to {mef_path}...", flush=True)
+        write_mosaic_mef(mef_path)
+        print("Done.", flush=True)
+        return
+    ideal_image, noisy_image, ccd_ra, ccd_dec, dx_mm, dy_mm, stars_on_patch = (
+        simulate_ccd(ccd_number)
+    )
     ra_radius, dec_radius, pad_ra, pad_dec = ccd_sky_extents(ccd_dec)
-
     smash_data = get_smash_data(
         ccd_ra,
         ccd_dec,
         ra_radius + pad_ra,
         dec_radius + pad_dec,
     )
-    ideal_image, stars_on_patch = pixelate_smash_data(
-        smash_data,
-        ccd_ra,
-        ccd_dec,
-        ra_radius,
-        dec_radius,
-    )
-    noisy_image = simulate_microchip(ideal_image)
-
-    dx_mm, dy_mm = get_ccd_location(ccd_number)
     print(f"CCD {ccd_number} offset from array center: ({dx_mm:.3f}, {dy_mm:.3f}) mm")
     print(f"CCD sky center: RA={ccd_ra:.5f}, Dec={ccd_dec:.5f}")
     print(f"Patch size: {ideal_image.shape[1]} x {ideal_image.shape[0]} pix")
@@ -389,4 +702,27 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+
+    def _cli_fits_path(default: str) -> str:
+        paths = [a for a in sys.argv[2:] if not a.startswith("--")]
+        return paths[0] if paths else default
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--patch-mef":
+        patch_mef_headers(
+            _cli_fits_path(mef_path),
+            gaps=True if "--gaps" in sys.argv else None,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "--stitch":
+        stitch_focal_plane(
+            _cli_fits_path(mef_path),
+            sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else focal_plane_path,
+        )
+    elif len(sys.argv) > 1 and sys.argv[1] == "--stitch-gaps":
+        stitch_focal_plane(
+            _cli_fits_path(mef_path),
+            sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith("--") else focal_plane_path,
+            gaps=True,
+        )
+    else:
+        main()
