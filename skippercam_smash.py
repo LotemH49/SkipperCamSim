@@ -9,9 +9,9 @@ from astropy.wcs import WCS
 
 #tunables
 ccd_number = 12  # 1-20
-write_mef = True
+write_mef = False
 _PROJECT_ROOT = Path(__file__).resolve().parent
-mef_path = "FITS/skippercam_sim_v2.fits"
+mef_path = "FITS/skippercam_sim_v4.fits"
 focal_plane_gaps = False  # False = abutting 4x5 grid; True = physical mm gaps
 write_focal_plane = False  # auto-stitch after MEF export
 focal_plane_path = "FITS/skippercam_focal_plane_sim_v2.fits"
@@ -40,7 +40,7 @@ ccd_dec_read_radius = 0.5 * ccd_height_px * _pix_scale_deg
 
 ZP_g = 1.64E+09  # integrated e- for a 0-mag source in one exposure
 m_ref = 2.5 * np.log10(ZP_g)  # reference magnitude tied to ZP_g
-sky_e_rate = 3.11E+01  # e- / s / pixel (SkipperCam paper Sec. 2.4)[changes with 0 point]
+sky_e_rate = 2.37  # e- / s / pixel (SkipperCam paper Sec. 2.4)[changes with 0 point]
 g_lim = 20  # monitored sources: g < g_lim (INFO.md / paper)
 
 psf_pad_deg = psf_pad_pix * pix_size / 3600.0
@@ -50,7 +50,7 @@ faint_gmag_max = 99  # SMASH sentinel for valid magnitudes
 
 # Load SMASH DR2 sample data
 smash_df = pd.read_csv("lmc_smash_g99_v3.csv")
-#smash_df = pd.read_csv("lmc_onestar_tester.csv")
+#smash_df = pd.read_csv("data/catalogs/lmc_onestar_tester.csv")
 
 # CCD center offset from array center (mm). +x = +RA, +y = +Dec. (0, 0) = lmc_ra/lmc_dec.
 x_offset = 25.95876
@@ -120,7 +120,7 @@ def get_smash_data(ra, dec, ra_read_radius, dec_read_radius):
 def get_charge(m_target, m_ref_mag=m_ref, exposure_time_s=exposure_time):
     m_target = np.asarray(m_target, dtype=np.float64)
     rate =  np.power(10.0, -0.4 * (m_target - m_ref_mag))
-    return rate * exposure_time_s
+    return np.random.poisson(rate * exposure_time_s)
 
 
 # Map sky RA/Dec (deg) to floating-point pixel coordinates on the image.
@@ -570,9 +570,9 @@ def simulate_microchip(
     readout_sigma=readout_noise,
 ):
     sky_e = sky_rate * exposure_time_s
-    expected = np.maximum(signal_image + sky_e, 0.0)
-    poisson_image = np.random.poisson(expected).astype(np.float32)
-    return add_readout_noise(poisson_image, readout_sigma)
+    sky_e_image = np.random.poisson(sky_e,size=signal_image.shape)
+    noisy_image = signal_image + sky_e_image
+    return add_readout_noise(noisy_image, readout_sigma)
 
 
 # Scatter plot of source positions in the sky patch.
@@ -662,6 +662,7 @@ def display_ideal_vs_noisy(ideal_image, noisy_image, vmin_pct=1.0, vmax_pct=99.0
 
 # Load SMASH data, pixelate, simulate noise, print survey stats, and display.
 def main():
+    
     if write_mef:
         print(f"Writing 20-CCD MEF to {mef_path}...", flush=True)
         write_mosaic_mef(mef_path)
@@ -677,10 +678,11 @@ def main():
         ra_radius + pad_ra,
         dec_radius + pad_dec,
     )
+    print(m_ref)
+    print(10**(-0.4 * (22.1 - m_ref)))
     print(f"CCD {ccd_number} offset from array center: ({dx_mm:.3f}, {dy_mm:.3f}) mm")
     print(f"CCD sky center: RA={ccd_ra:.5f}, Dec={ccd_dec:.5f}")
     print(f"Patch size: {ideal_image.shape[1]} x {ideal_image.shape[0]} pix")
-    print(f"Charge at g={g_lim}: {get_charge(g_lim):.2f} e-")
     n_deposited = len(smash_data[smash_data["gmag"] < faint_gmag_max])
     print(f"Deposited stars (incl. PSF pad): {n_deposited:,}")
     print(f"Sources in patch (centers only): {len(stars_on_patch):,}")

@@ -11,5 +11,6 @@ __pycache__/
 
 # Large/local data (download separately)
 *.csv
-simular_curvitas/simulated_images/
-simular_curvitas/previews/
+FITS/
+experiments/curvitas/simulated_images/
+experiments/curvitas/previews/
