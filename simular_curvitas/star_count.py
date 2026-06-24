@@ -58,22 +58,30 @@ GAIN = 1.0                  # data already in electrons
 # Matched-filter peak detector (primary)
 MIN_PEAK_DISTANCE = 3        # min separation between peaks [pix] (FWHM ~ 3.5)
 
+# Bright peanut doubles: split merged S/N bumps with two raw cores (weak stars untouched)
+USE_RAW_SPLIT = True
+RAW_SPLIT_RADIUS_PIX = 12
+RAW_SPLIT_MIN_FRAC = 0.28    # secondary core >= this fraction of primary raw [e-/pix]
+RAW_SPLIT_MAX_SEP_PIX = 10   # cores farther apart are unrelated neighbors
+RAW_SPLIT_MIN_PRIMARY_E = 600.0   # only inspect bright bumps [e-/pix peak]
+RAW_SPLIT_BRIGHT_RAW_E = 2500.0   # above this: single PSF core, never split
+
 # Clump refinement: split blended groups using shape + local iterative subtraction
 USE_CLUMP_REFINE = True
-CLUMP_SN_FRAC = 0.50         # clump mask = S/N above this fraction of SN_THRESHOLD
+CLUMP_SN_FRAC = 0.75         # clump mask = S/N above this fraction of SN_THRESHOLD
 CLUMP_MIN_AREA = 10          # min labeled area [pix] to consider
-CLUMP_AREA_FACTOR = 2      # area > factor * pi*(2*sigma)^2 -> suspect blend
-CLUMP_ECCENTRICITY = .55    # elongated blobs likely hold >1 star
+CLUMP_AREA_FACTOR = 1      # area > factor * pi*(2*sigma)^2 -> suspect blend
+CLUMP_ECCENTRICITY = .1    # elongated blobs likely hold >1 star
 CLUMP_EXTENT_MAX = 0.45      # area/bbox; compact clumps = single star
-CLUMP_PAD_PIX = 7            # ROI padding around clump bbox
-CLUMP_ITER_ROUNDS = 3           # local subtract + re-detect passes per clump
+CLUMP_PAD_PIX = 20            # ROI padding around clump bbox
+CLUMP_ITER_ROUNDS = 5           # local subtract + re-detect passes per clump
 CLUMP_MAX_PEAKS_PER_ROUND = 24  # peak_local_max cap inside each clump per round
-CLUMP_MAX_AREA = 2500           # skip huge connected regions [pix]
+CLUMP_MAX_AREA = 5000           # skip huge connected regions [pix]
 
 # Star map / run mode
 SHOW_PLOT = True            # True: plot CCD star map
 SHOW_HIST = False           # True: g-band histogram (detected vs SMASH catalog)
-CCD_TO_MAP = 17              # CCD to plot when SHOW_PLOT=True (1-20, or "CCD05")
+CCD_TO_MAP = 12              # CCD to plot when SHOW_PLOT=True (1-20, or "CCD05")
 HOVER_RADIUS_PIX = 4        # show charge when cursor is within this many px of a star
 SN_COLORMAP = LinearSegmentedColormap.from_list(
     "teal_orange", ["#008080", "#FF8C00"], N=256
@@ -81,12 +89,18 @@ SN_COLORMAP = LinearSegmentedColormap.from_list(
 SN_COLOR_VMAX_PCT = 99      # color scale vmax = this percentile of detected S/N
 STAR_MARKER_RADIUS = 0      # 0 = single center pixel per star
 
+# Quick QA without rendering a full map (matplotlib x, y coords)
+SPOT_CHECK_RADIUS_PIX = 6.0
+PEANUT_QA_SPOTS: dict[int, list[tuple[float, float]]] = {
+    12: [(485.0, 77.0), (484.0, 83.0)],  # CCD12 top / bottom peanut lobes
+}
+
 # g-band histogram (SHOW_HIST or: python star_count.py hist)
-HIST_BINS = 100
+HIST_BINS = 10
 HIST_GMAG_MIN = 12.0        # brighter (lower g) ←——→ fainter (higher g)
 HIST_GMAG_MAX = 24.0
 HIST_LOG_Y = True           # log scale helps ~10M catalog sources vs ~200k detections
-HIST_SAVE = False           # write PNG alongside interactive window
+HIST_SAVE = True           # write PNG alongside interactive window
 HIST_SKY_DEDUP_ARCSEC = 0.01  # dedupe SMASH rows by sky position (id is NOT unique)
 
 # Photometry zero-point (skippercam_smash.py: ZP_g integrated e- at g=0, one exposure)
@@ -227,6 +241,146 @@ def check_no_double_count(
     min_sep = float(nn_dist[:, 1].min())
     violations = len(tree.query_pairs(r - 1e-9))
     return violations, min_sep
+
+
+def _enforce_min_separation(
+    positions: np.ndarray,
+    snr: np.ndarray,
+    flux: np.ndarray,
+    min_dist: float | None = None,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Greedy filter: keep highest-flux detections at least min_dist apart."""
+    if len(positions) <= 1:
+        return positions, snr, flux
+    r = _min_peak_distance(min_dist)
+    cell = max(1, int(r))
+    md2 = r * r
+    order = np.argsort(-flux)
+    grid: dict[tuple[int, int], list[int]] = {}
+    kept: list[int] = []
+
+    for i in order:
+        py, px = int(positions[i, 0]), int(positions[i, 1])
+        cy, cx = py // cell, px // cell
+        ok = True
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                for j in grid.get((cy + dy, cx + dx), []):
+                    d2 = (positions[j, 0] - py) ** 2 + (positions[j, 1] - px) ** 2
+                    if d2 < md2:
+                        ok = False
+                        break
+                if not ok:
+                    break
+            if not ok:
+                break
+        if ok:
+            kept.append(int(i))
+            grid.setdefault((cy, cx), []).append(int(i))
+
+    idx = np.array(sorted(kept), dtype=np.intp)
+    return positions[idx], snr[idx], flux[idx]
+
+
+def _local_raw_maxima(
+    win: np.ndarray,
+    min_distance: int,
+    threshold_abs: float,
+    num_peaks: int,
+) -> np.ndarray:
+    if win.size == 0:
+        return np.empty((0, 2), dtype=np.intp)
+    size = 2 * min_distance + 1
+    mx = ndi.maximum_filter(win, size=size, mode="nearest")
+    mask = (win >= threshold_abs) & (win == mx)
+    coords = np.argwhere(mask)
+    if len(coords) == 0:
+        return np.empty((0, 2), dtype=np.intp)
+    vals = win[coords[:, 0], coords[:, 1]]
+    order = np.argsort(-vals)
+    picked: list[np.ndarray] = []
+    md2 = min_distance * min_distance
+    for k in order:
+        if len(picked) >= num_peaks:
+            break
+        c = coords[k]
+        if any(float(np.sum((p - c) ** 2)) < md2 for p in picked):
+            continue
+        picked.append(c)
+    return np.array(picked, dtype=np.intp) if picked else np.empty((0, 2), dtype=np.intp)
+
+
+def _split_bright_raw_peaks(
+    img: np.ndarray,
+    corr: np.ndarray,
+    snr_map: np.ndarray,
+    peaks: np.ndarray,
+    snr: np.ndarray,
+    flux: np.ndarray,
+    sn_threshold: float,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Add a second core for bright peanuts; leave all other detections unchanged."""
+    if not USE_RAW_SPLIT or len(peaks) == 0:
+        return peaks, snr, flux
+
+    h, w = img.shape
+    extra_yx: list[list[int]] = []
+    extra_snr: list[float] = []
+    extra_flux: list[float] = []
+
+    for py, px in peaks:
+        py, px = int(py), int(px)
+        y0 = max(0, py - RAW_SPLIT_RADIUS_PIX)
+        y1 = min(h, py + RAW_SPLIT_RADIUS_PIX + 1)
+        x0 = max(0, px - RAW_SPLIT_RADIUS_PIX)
+        x1 = min(w, px + RAW_SPLIT_RADIUS_PIX + 1)
+        win = img[y0:y1, x0:x1]
+        peak_raw = float(win.max())
+        if peak_raw < RAW_SPLIT_MIN_PRIMARY_E or peak_raw >= RAW_SPLIT_BRIGHT_RAW_E:
+            continue
+
+        thresh = peak_raw * RAW_SPLIT_MIN_FRAC
+        sub = _local_raw_maxima(win, MIN_PEAK_DISTANCE, thresh, num_peaks=2)
+        if len(sub) < 2:
+            continue
+
+        sub_yx = np.asarray(sub, dtype=np.intp).reshape(-1, 2)
+        sub_vals = win[sub_yx[:, 0], sub_yx[:, 1]].astype(np.float64)
+        rank = np.argsort(-sub_vals)
+        i0, i1 = sub_yx[rank[0]], sub_yx[rank[1]]
+        i0_val, i1_val = float(sub_vals[rank[0]]), float(sub_vals[rank[1]])
+        gy0, gx0 = int(y0 + i0[0]), int(x0 + i0[1])
+        gy1, gx1 = int(y0 + i1[0]), int(x0 + i1[1])
+        sep = float(np.hypot(gx1 - gx0, gy1 - gy0))
+        if not (
+            i1_val >= i0_val * RAW_SPLIT_MIN_FRAC
+            and MIN_PEAK_DISTANCE <= sep <= RAW_SPLIT_MAX_SEP_PIX
+        ):
+            continue
+
+        # Add the companion core that is not already a detection.
+        for gy, gx in ((gy0, gx0), (gy1, gx1)):
+            if _peaks_too_close(gy, gx, peaks, MIN_PEAK_DISTANCE):
+                continue
+            if extra_yx and _peaks_too_close(
+                gy, gx, np.array(extra_yx, dtype=np.intp), MIN_PEAK_DISTANCE
+            ):
+                continue
+            snr_val = float(snr_map[gy, gx])
+            if snr_val < sn_threshold:
+                continue
+            cp = float(_parabolic_peak_value(corr, np.array([gy]), np.array([gx]))[0])
+            extra_yx.append([gy, gx])
+            extra_snr.append(snr_val)
+            extra_flux.append(cp / KERNEL_SQ_SUM)
+
+    if not extra_yx:
+        return peaks, snr, flux
+
+    peaks = np.vstack([peaks, np.array(extra_yx, dtype=np.intp)])
+    snr = np.concatenate([snr, np.array(extra_snr)])
+    flux = np.concatenate([flux, np.array(extra_flux)])
+    return peaks, snr, flux
 
 
 def _iterative_peaks_in_roi(
@@ -443,22 +597,26 @@ def detect_matched_filter(data: np.ndarray, sn_threshold: float) -> dict:
     peaks, snr, flux = _refine_clump_peaks(
         img_sub, var, snr_map, peaks, snr, flux, sn_threshold
     )
+    peaks, snr, flux = _split_bright_raw_peaks(
+        img, corr, snr_map, peaks, snr, flux, sn_threshold
+    )
+    peaks, snr, flux = _enforce_min_separation(peaks, snr, flux)
 
     # Snap each detection to the brightest RAW pixel in a small window so the
     # plotted marker sits on the star's true peak pixel (not the smoothed peak).
-    by, bx = _brightest_pixels(img, peaks, radius=MIN_PEAK_DISTANCE)
+    by, bx = _brightest_pixels(img, peaks, radius=1)
 
-    # Two peaks may snap onto the same brightest pixel -> keep one (no dup).
     bright = np.stack([by, bx], axis=1)
+    # Same raw pixel from two S/N peaks, or markers closer than MIN_PEAK_DISTANCE.
     _, keep = np.unique(bright, axis=0, return_index=True)
-    keep.sort()
-    by, bx = by[keep], bx[keep]
-    peaks, snr = peaks[keep], snr[keep]
-    flux = flux[keep]
+    keep = np.sort(keep)
+    bright = bright[keep]
+    peaks, snr, flux = peaks[keep], snr[keep], flux[keep]
+    bright, snr, flux = _enforce_min_separation(bright, snr, flux)
 
     return {
-        "peaks": peaks,                       # S/N-map peak (y, x)
-        "bright_pix": np.stack([by, bx], 1),  # brightest raw pixel (y, x)
+        "peaks": peaks,
+        "bright_pix": bright,
         "flux": flux, "snr": snr,
         "snr_map": snr_map, "img": img, "med_back": med_back,
     }
@@ -664,7 +822,7 @@ def make_star_map(selector, show: bool = True, save: bool = True) -> int:
     flux = res["flux"]
     snr = res["snr"]
     n = len(peaks)
-    violations, min_sep = check_no_double_count(peaks)
+    violations, min_sep = check_no_double_count(bright)
 
     # Grayscale percentile stretch over positive pixels, matching
     # skippercam_smash.py display_image().
@@ -1031,6 +1189,88 @@ def run_counts():
     print(f"Elapsed: {elapsed:.1f}s ({elapsed / 20:.1f}s / CCD)")
 
 
+def _spots_near(
+    bright: np.ndarray,
+    flux: np.ndarray,
+    snr: np.ndarray,
+    yi: int,
+    xi: int,
+    radius_pix: float,
+) -> np.ndarray:
+    d2 = (bright[:, 0] - yi) ** 2 + (bright[:, 1] - xi) ** 2
+    return np.where(d2 <= radius_pix * radius_pix)[0]
+
+
+def check_spot(
+    selector,
+    x: float,
+    y: float,
+    *,
+    radius_pix: float | None = None,
+) -> bool:
+    """Quick QA at matplotlib (x, y) without rendering a map. Returns True if covered."""
+    radius_pix = SPOT_CHECK_RADIUS_PIX if radius_pix is None else radius_pix
+    yi, xi = int(round(y)), int(round(x))
+
+    t0 = time.perf_counter()
+    with fits.open(FITS_PATH) as hdul:
+        hdu_idx, name = resolve_ccd(hdul, selector)
+        data = hdul[hdu_idx].data
+
+    res = detect_matched_filter(data, SN_THRESHOLD)
+    elapsed = time.perf_counter() - t0
+    img = res["img"]
+    bright = res["bright_pix"]
+    flux = res["flux"]
+    snr = res["snr"]
+
+    raw = float(img[yi, xi]) if 0 <= yi < img.shape[0] and 0 <= xi < img.shape[1] else float("nan")
+    near = _spots_near(bright, flux, snr, yi, xi, radius_pix)
+
+    print(f"{name} spot check @ matplotlib (x={x:g}, y={y:g}) -> img[{yi}, {xi}]")
+    print(f"  raw = {raw:.1f} e-/pix  |  radius = {radius_pix:g} px  |  {elapsed:.1f}s")
+    if len(near):
+        print(f"  {len(near)} detection(s) within radius:")
+        for i in near:
+            by, bx = int(bright[i, 0]), int(bright[i, 1])
+            dist = float(np.hypot(bx - xi, by - yi))
+            print(
+                f"    marker [{by}, {bx}]  dist {dist:.2f} px  "
+                f"flux {flux[i]:.0f} e-  S/N {snr[i]:.1f}"
+            )
+        ok = True
+    else:
+        print("  NO detection within radius")
+        ok = False
+
+    print(f"  -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
+def check_peanut(selector=12) -> bool:
+    """Check all reference peanut lobes defined for a CCD."""
+    ccd_num = int(selector) if str(selector).isdigit() else selector
+    key = ccd_num if isinstance(ccd_num, int) else None
+    if key is None:
+        with fits.open(FITS_PATH) as hdul:
+            _, name = resolve_ccd(hdul, selector)
+            key = int("".join(c for c in name if c.isdigit()) or 0)
+    spots = PEANUT_QA_SPOTS.get(int(key), [])
+    if not spots:
+        print(f"No PEANUT_QA_SPOTS for CCD {key}")
+        return False
+
+    print(f"Peanut QA on CCD{key} ({len(spots)} lobes)", flush=True)
+    ok = True
+    for x, y in spots:
+        print()
+        if not check_spot(key, x, y):
+            ok = False
+    print()
+    print(f"Peanut QA -> {'PASS' if ok else 'FAIL'}")
+    return ok
+
+
 def main():
     args = sys.argv[1:]
     if args and args[0] == "map":
@@ -1046,6 +1286,16 @@ def main():
             print(f"All maps done in {time.time() - t0:.1f}s")
         else:
             make_star_map(selector, show=True, save=True)
+    elif args and args[0] == "spot":
+        if len(args) >= 4:
+            selector = args[1]
+            x, y = float(args[2]), float(args[3])
+            radius = float(args[4]) if len(args) > 4 else None
+            ok = check_spot(selector, x, y, radius_pix=radius)
+        else:
+            selector = args[1] if len(args) > 1 else CCD_TO_MAP
+            ok = check_peanut(selector)
+        sys.exit(0 if ok else 1)
     elif args and args[0] == "counts":
         run_counts()
     elif args and args[0] == "hist":

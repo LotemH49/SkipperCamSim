@@ -85,7 +85,7 @@ def render_star_map(
     flux = res["flux"]
     snr = res["snr"]
     n = len(peaks)
-    violations, min_sep = sc.check_no_double_count(peaks)
+    violations, min_sep = sc.check_no_double_count(bright)
 
     img = res["img"]
     finite = img[np.isfinite(img)]
