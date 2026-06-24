@@ -56,14 +56,14 @@ PSF_SIGMA_PIX = 1.5        # Gaussian PSF sigma [pix]      (PSFSIG)
 GAIN = 1.0                  # data already in electrons
 
 # Matched-filter peak detector (primary)
-MIN_PEAK_DISTANCE = 2        # min separation between peaks [pix] (FWHM ~ 3.5)
+MIN_PEAK_DISTANCE = 3        # min separation between peaks [pix] (FWHM ~ 3.5)
 
 # Clump refinement: split blended groups using shape + local iterative subtraction
 USE_CLUMP_REFINE = True
 CLUMP_SN_FRAC = 0.50         # clump mask = S/N above this fraction of SN_THRESHOLD
 CLUMP_MIN_AREA = 10          # min labeled area [pix] to consider
-CLUMP_AREA_FACTOR = 2.0      # area > factor * pi*(2*sigma)^2 -> suspect blend
-CLUMP_ECCENTRICITY = 0.55    # elongated blobs likely hold >1 star
+CLUMP_AREA_FACTOR = 2      # area > factor * pi*(2*sigma)^2 -> suspect blend
+CLUMP_ECCENTRICITY = .55    # elongated blobs likely hold >1 star
 CLUMP_EXTENT_MAX = 0.45      # area/bbox; compact clumps = single star
 CLUMP_PAD_PIX = 7            # ROI padding around clump bbox
 CLUMP_ITER_ROUNDS = 3           # local subtract + re-detect passes per clump
@@ -71,9 +71,9 @@ CLUMP_MAX_PEAKS_PER_ROUND = 24  # peak_local_max cap inside each clump per round
 CLUMP_MAX_AREA = 2500           # skip huge connected regions [pix]
 
 # Star map / run mode
-SHOW_PLOT = False            # True: plot CCD star map
+SHOW_PLOT = True            # True: plot CCD star map
 SHOW_HIST = False           # True: g-band histogram (detected vs SMASH catalog)
-CCD_TO_MAP = 12              # CCD to plot when SHOW_PLOT=True (1-20, or "CCD05")
+CCD_TO_MAP = 17              # CCD to plot when SHOW_PLOT=True (1-20, or "CCD05")
 HOVER_RADIUS_PIX = 4        # show charge when cursor is within this many px of a star
 SN_COLORMAP = LinearSegmentedColormap.from_list(
     "teal_orange", ["#008080", "#FF8C00"], N=256
@@ -186,11 +186,47 @@ def _subtract_psf_stamp(
     work[y0:y1, x0:x1] -= flux * PSF_KERNEL[ky0:ky1, kx0:kx1]
 
 
-def _peaks_too_close(py: int, px: int, peaks: np.ndarray, min_dist: float) -> bool:
+def _min_peak_distance(min_dist: float | None = None) -> float:
+    return MIN_PEAK_DISTANCE if min_dist is None else min_dist
+
+
+def _peaks_too_close(
+    py: int,
+    px: int,
+    peaks: np.ndarray,
+    min_dist: float | None = None,
+) -> bool:
+    """True if (py, px) is strictly inside the min-distance exclusion zone of any peak."""
     if len(peaks) == 0:
         return False
-    d2 = (peaks[:, 0] - py) ** 2 + (peaks[:, 1] - px) ** 2
-    return bool(np.min(d2) < min_dist * min_dist)
+    r = _min_peak_distance(min_dist)
+    pt = np.array([py, px], dtype=np.float64)
+    if len(peaks) < 48:
+        d2 = (peaks[:, 0] - py) ** 2 + (peaks[:, 1] - px) ** 2
+        return bool(np.min(d2) < r * r)
+    dist, _ = cKDTree(peaks.astype(np.float64, copy=False)).query(pt, k=1)
+    return float(dist) < r
+
+
+def check_no_double_count(
+    peaks: np.ndarray,
+    min_dist: float | None = None,
+) -> tuple[int, float]:
+    """Return (n_close_pairs, nearest_neighbour_separation_px).
+
+    A close pair is two peaks with separation < min_dist. Uses query_pairs so
+    each violating pair is counted once (not once per peak). With
+    peak_local_max enforcing min_dist, violations should be 0 on every CCD.
+    """
+    if len(peaks) < 2:
+        return 0, float("inf")
+    r = _min_peak_distance(min_dist)
+    pts = peaks.astype(np.float64, copy=False)
+    tree = cKDTree(pts)
+    nn_dist, _ = tree.query(pts, k=2)
+    min_sep = float(nn_dist[:, 1].min())
+    violations = len(tree.query_pairs(r - 1e-9))
+    return violations, min_sep
 
 
 def _iterative_peaks_in_roi(
@@ -468,21 +504,6 @@ def count_matched_filter(
     """Return (n_peaks, total_fluxes_e, median_background)."""
     res = detect_matched_filter(data, sn_threshold)
     return len(res["peaks"]), res["flux"], res["med_back"]
-
-
-def check_no_double_count(peaks: np.ndarray) -> tuple[int, float]:
-    """Return (n_pairs_closer_than_min_distance, nearest_neighbour_separation).
-
-    peak_local_max enforces a minimum separation, so violations must be 0;
-    this is an explicit proof that no star is counted twice within a CCD.
-    """
-    if len(peaks) < 2:
-        return 0, float("inf")
-    tree = cKDTree(peaks)
-    nn_dist, _ = tree.query(peaks, k=2)
-    nearest = nn_dist[:, 1]
-    violations = int(np.sum(nearest < MIN_PEAK_DISTANCE))
-    return violations, float(nearest.min())
 
 
 # ----------------------------------------------------------------------------
